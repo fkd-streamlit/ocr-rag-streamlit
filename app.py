@@ -172,39 +172,56 @@ def preprocess_image(
     result = Image.fromarray(cv2.cvtColor(thresh, cv2.COLOR_GRAY2RGB))
     return result
 
-
-def perform_ocr(
-    image: Image.Image,
-    lang: str = 'jpn',
-    psm: int = 6,
-    oem: int = 3
-) -> Dict[str, any]:
+def perform_ocr(image: Image.Image, lang: str = "jpn", psm: int = 6, oem: int = 3) -> Dict[str, Any]:
     """
-    OCR処理を実行
-    
-    Args:
-        image: PIL Image
-        lang: 言語コード
-        psm: Page Segmentation Mode (0-13)
-        oem: OCR Engine Mode (0-3)
-    
-    Returns:
-        OCR結果の辞書
+    OCR処理：
+    - Tesseractが使えれば pytesseract
+    - 使えなければ EasyOCR にフォールバック（Streamlit Cloud向け）
     """
+    # まずTesseractを試す
     try:
-        # Tesseractのパスを確認（Linux環境対応）
-        tesseract_cmd = getattr(pytesseract.pytesseract, 'tesseract_cmd', None)
-        if not tesseract_cmd or (not os.path.exists(tesseract_cmd) and platform.system() != 'Windows'):
-            # Linux環境では、whichコマンドで検索を試みる
-            import shutil
-            tesseract_path = shutil.which('tesseract')
-            if tesseract_path:
-                pytesseract.pytesseract.tesseract_cmd = tesseract_path
-            else:
-                raise Exception(
-                    "Tesseract OCRが見つかりません。\n"
-                    "Streamlit Cloudでは、packages.txtに 'tesseract-ocr' と 'tesseract-ocr-jpn' が含まれていることを確認してください。"
-                )
+        custom_config = f"--oem {oem} --psm {psm} -l {lang}"
+        text = pytesseract.image_to_string(image, config=custom_config)
+
+        # 成功しているが空文字の場合もあるので軽く判定
+        if text and text.strip():
+            data = pytesseract.image_to_data(image, config=custom_config, output_type=pytesseract.Output.DICT)
+            return {
+                "text": text,
+                "data": data,
+                "word_count": len([w for w in text.split() if w.strip()]),
+                "char_count": len(text),
+                "engine": "tesseract",
+            }
+    except Exception:
+        pass
+
+    # Tesseractが無理なら EasyOCR
+    try:
+        import easyocr
+        # reader の生成は重いのでキャッシュ
+        @st.cache_resource
+        def _get_reader():
+            # 日本語+英語（必要なら追加）
+            return easyocr.Reader(["ja", "en"], gpu=False)
+        reader = _get_reader()
+
+        np_img = np.array(image.convert("RGB"))
+        results = reader.readtext(np_img, detail=0)  # text only
+        text = "\n".join(results)
+
+        return {
+            "text": text,
+            "data": {},
+            "word_count": len([w for w in text.split() if w.strip()]),
+            "char_count": len(text),
+            "engine": "easyocr",
+        }
+    except Exception as e:
+        st.error(f"OCRエラー: {str(e)}")
+        return {"text": "", "data": {}, "word_count": 0, "char_count": 0, "engine": "none"}
+
+
         
         # Tesseract設定
         custom_config = f'--oem {oem} --psm {psm} -l {lang}'
@@ -684,3 +701,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
