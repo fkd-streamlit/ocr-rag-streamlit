@@ -1,25 +1,22 @@
-# app.py
 """
-技術資料OCR・RAG検索アプリケーション（ルートC：OCRはローカル、Cloudは検索共有）
-- ローカルで作成したOCR結果JSONをアップロードして蓄積
-- ChromaDB + SentenceTransformers があればRAG検索（ベクトル検索）
-- ない場合でも簡易検索（部分一致）で最低限動作
+技術資料RAG検索アプリ（Cloud検索専用版 / ルートC）
+- ローカルでOCR→JSON化した結果（data/ocr_results/*.json）を読み込み
+- ChromaDB + SentenceTransformers で検索（RAGの「R」部分）
+- Streamlit CloudではOCRを一切しない（Tesseract不要）
 """
 
 from __future__ import annotations
 
 import json
-import os
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, List, Any, Optional
 
 import streamlit as st
 
-# -------------------------
-# 0) 設定（config.py があれば優先）
-# -------------------------
+# -----------------------------
+# 設定読み込み（config.pyがあれば使う）
+# -----------------------------
 try:
     from config import (
         DATA_DIR,
@@ -39,469 +36,303 @@ except Exception:
     DEFAULT_SEARCH_RESULTS = 5
     MAX_SEARCH_RESULTS = 10
 
-for d in [DATA_DIR, OCR_RESULTS_DIR, VECTOR_DB_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
+# ディレクトリ確保
+OCR_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+VECTOR_DB_DIR.mkdir(parents=True, exist_ok=True)
 
-# -------------------------
-# 1) RAG依存の読み込み（あれば使う）
-# -------------------------
-CHROMADB_AVAILABLE = True
-CHROMA_IMPORT_ERROR = ""
-
+# -----------------------------
+# RAGライブラリ（必須）
+# -----------------------------
 try:
     import chromadb
-    from chromadb.config import Settings
     from sentence_transformers import SentenceTransformer
-except Exception as e:
-    CHROMADB_AVAILABLE = False
-    CHROMA_IMPORT_ERROR = str(e)
+    CHROMA_OK = True
+except Exception:
+    CHROMA_OK = False
 
-# -------------------------
-# 2) UI設定
-# -------------------------
+# -----------------------------
+# UI
+# -----------------------------
 st.set_page_config(
-    page_title="技術資料OCR・RAG検索（ルートC）",
-    page_icon="📄",
+    page_title="技術資料RAG検索（Cloud検索専用）",
+    page_icon="🔎",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# -------------------------
-# 3) データ構造
-# -------------------------
-REQUIRED_JSON_KEYS = {"id", "filename", "text", "uploaded_at"}
+st.title("🔎 技術資料RAG検索（Cloud検索専用 / ルートC）")
+st.caption("※ このCloudアプリはOCRしません。ローカルで作ったJSONを読み込んで検索します。")
+st.markdown("---")
 
-@dataclass
-class Doc:
-    id: str
-    filename: str
-    text: str
-    uploaded_at: str
-    meta: Dict[str, Any]
 
-def now_id(prefix: str = "doc") -> str:
-    return f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-def safe_load_json(b: bytes) -> Dict[str, Any]:
-    return json.loads(b.decode("utf-8"))
-
-def validate_doc_json(obj: Dict[str, Any]) -> Tuple[bool, str]:
-    missing = REQUIRED_JSON_KEYS - set(obj.keys())
-    if missing:
-        return False, f"必須キーが不足しています: {sorted(list(missing))}"
-    if not isinstance(obj.get("text", ""), str):
-        return False, "text は文字列である必要があります"
-    if not obj["id"]:
-        return False, "id が空です"
-    return True, ""
-
-def normalize_doc(obj: Dict[str, Any]) -> Doc:
-    meta = dict(obj)
-    return Doc(
-        id=str(obj["id"]),
-        filename=str(obj.get("filename", "")),
-        text=str(obj.get("text", "")),
-        uploaded_at=str(obj.get("uploaded_at", "")),
-        meta=meta,
-    )
-
-# -------------------------
-# 4) JSON保管（Cloudでは永続保証なしだが、共有用途は「アップロード」運用でOK）
-# -------------------------
-def list_saved_json_files() -> List[Path]:
-    return sorted(OCR_RESULTS_DIR.glob("*.json"))
-
-def load_docs_from_disk() -> List[Doc]:
-    docs: List[Doc] = []
-    for p in list_saved_json_files():
+# -----------------------------
+# ユーティリティ
+# -----------------------------
+def load_json_documents(json_dir: Path) -> List[Dict[str, Any]]:
+    """data/ocr_results/*.json を読み込む"""
+    docs: List[Dict[str, Any]] = []
+    for p in sorted(json_dir.glob("*.json")):
         try:
             obj = json.loads(p.read_text(encoding="utf-8"))
-            ok, msg = validate_doc_json(obj)
-            if not ok:
-                continue
-            docs.append(normalize_doc(obj))
+            # 必須キーを正規化
+            doc_id = obj.get("id") or p.stem
+            filename = obj.get("filename") or obj.get("source") or p.name
+            text = obj.get("text") or ""
+            uploaded_at = obj.get("uploaded_at") or obj.get("created_at") or ""
+            ocr_settings = obj.get("ocr_settings") or {}
+
+            docs.append(
+                {
+                    "id": str(doc_id),
+                    "filename": str(filename),
+                    "text": str(text),
+                    "uploaded_at": str(uploaded_at),
+                    "ocr_settings": ocr_settings,
+                    "_path": str(p),
+                }
+            )
         except Exception:
+            # 壊れたJSONが混ざっていても落とさない
             continue
     return docs
 
-def save_doc_to_disk(doc: Doc) -> Path:
-    out = OCR_RESULTS_DIR / f"{doc.id}.json"
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(doc.meta, f, ensure_ascii=False, indent=2)
-    return out
-
-def delete_doc_files(doc_id: str) -> None:
-    p = OCR_RESULTS_DIR / f"{doc_id}.json"
-    if p.exists():
-        p.unlink()
-
-# -------------------------
-# 5) テキスト分割（RAG用 chunking）
-# -------------------------
-def chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> List[str]:
-    """
-    シンプルな文字数ベース分割（日本語向けに安定）
-    """
-    text = text.replace("\r\n", "\n")
-    if len(text) <= chunk_size:
-        return [text]
-
-    chunks: List[str] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        j = min(i + chunk_size, n)
-        chunk = text[i:j].strip()
-        if chunk:
-            chunks.append(chunk)
-        if j >= n:
-            break
-        i = max(0, j - overlap)
-    return chunks
-
-# -------------------------
-# 6) RAG（ChromaDB）
-# -------------------------
-@st.cache_resource
-def get_embedding_model() -> Optional["SentenceTransformer"]:
-    if not CHROMADB_AVAILABLE:
-        return None
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
 @st.cache_resource
-def get_chroma_collection():
-    if not CHROMADB_AVAILABLE:
-        return None
-    client = chromadb.Client(
-        Settings(
-            chroma_db_impl="duckdb+parquet",
-            persist_directory=str(VECTOR_DB_DIR),
-        )
-    )
-    try:
-        col = client.get_collection(VECTOR_DB_COLLECTION_NAME)
-    except Exception:
-        col = client.create_collection(VECTOR_DB_COLLECTION_NAME)
-    return col
+def get_embedding_model(model_name: str):
+    return SentenceTransformer(model_name)
 
-def rag_add_doc(doc: Doc) -> Tuple[bool, str]:
+
+@st.cache_resource
+def get_chroma_collection(persist_dir: str, collection_name: str):
     """
-    1文書を chunk に分解してベクトルDBに追加
+    Chroma の永続DBを開く（バージョン差分に強めに）
     """
-    if not CHROMADB_AVAILABLE:
-        return False, "ChromaDB/SentenceTransformers が未導入です"
-
-    model = get_embedding_model()
-    col = get_chroma_collection()
-    if model is None or col is None:
-        return False, "RAG初期化に失敗しました"
-
-    chunks = chunk_text(doc.text)
-    ids = [f"{doc.id}__c{i:04d}" for i in range(len(chunks))]
-    metadatas = []
-    for i in range(len(chunks)):
-        metadatas.append(
-            {
-                "doc_id": doc.id,
-                "chunk_index": i,
-                "filename": doc.filename,
-                "uploaded_at": doc.uploaded_at,
-            }
-        )
-
+    # 新しめのAPI: PersistentClient
     try:
-        emb = model.encode(chunks).tolist()
-        col.add(ids=ids, embeddings=emb, documents=chunks, metadatas=metadatas)
-        return True, f"RAGに登録しました（chunks={len(chunks)}）"
-    except Exception as e:
-        return False, f"RAG登録エラー: {e}"
-
-def rag_delete_doc(doc_id: str) -> Tuple[bool, str]:
-    if not CHROMADB_AVAILABLE:
-        return False, "ChromaDB未導入"
-    col = get_chroma_collection()
-    if col is None:
-        return False, "コレクション取得失敗"
-
-    try:
-        # doc_id__c0000 のようなIDをまとめて削除
-        # where で doc_id 指定できればベストだが、環境差があるので get→filter で対応
-        # 取得件数が多くなる場合は運用で分割してください
-        all_ids = col.get(include=["metadatas"]).get("ids", [])
-        all_metas = col.get(include=["metadatas"]).get("metadatas", [])
-        del_ids = []
-        for _id, m in zip(all_ids, all_metas):
-            if isinstance(m, dict) and m.get("doc_id") == doc_id:
-                del_ids.append(_id)
-        if del_ids:
-            col.delete(ids=del_ids)
-        return True, f"RAGから削除しました（{len(del_ids)}件）"
-    except Exception as e:
-        return False, f"RAG削除エラー: {e}"
-
-def rag_search(query: str, n_results: int = 5) -> List[Dict[str, Any]]:
-    if not CHROMADB_AVAILABLE:
-        return []
-
-    model = get_embedding_model()
-    col = get_chroma_collection()
-    if model is None or col is None:
-        return []
-
-    try:
-        qemb = model.encode([query]).tolist()
-        res = col.query(query_embeddings=qemb, n_results=n_results, include=["documents", "metadatas", "distances", "ids"])
-        out: List[Dict[str, Any]] = []
-        if res and res.get("ids") and len(res["ids"][0]) > 0:
-            for i in range(len(res["ids"][0])):
-                out.append(
-                    {
-                        "id": res["ids"][0][i],
-                        "text": res["documents"][0][i],
-                        "metadata": res["metadatas"][0][i],
-                        "distance": res["distances"][0][i] if res.get("distances") else None,
-                    }
-                )
-        return out
+        client = chromadb.PersistentClient(path=persist_dir)
+        try:
+            col = client.get_collection(collection_name)
+        except Exception:
+            col = client.create_collection(collection_name)
+        return col
     except Exception:
-        return []
+        # 古いAPI: Client + Settings
+        try:
+            from chromadb.config import Settings
 
-# -------------------------
-# 7) 簡易検索（RAGが無いとき）
-# -------------------------
-def simple_search(docs: List[Doc], query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    q = query.strip()
-    if not q:
-        return []
-    hits = []
+            client = chromadb.Client(
+                Settings(chroma_db_impl="duckdb+parquet", persist_directory=persist_dir)
+            )
+            try:
+                col = client.get_collection(collection_name)
+            except Exception:
+                col = client.create_collection(collection_name)
+            return col
+        except Exception as e:
+            raise RuntimeError(f"Chroma初期化に失敗: {e}") from e
+
+
+def ensure_indexed(
+    docs: List[Dict[str, Any]],
+    collection,
+    model,
+) -> Dict[str, Any]:
+    """
+    JSONドキュメントをChromaに投入（未登録のみ）
+    """
+    # 既存ID一覧を取得（大量だと重いので、まずは docs のidだけ確認）
+    # Chromaに "get(ids=[...])" が通れば、それを使う
+    to_add = []
+    to_add_ids = []
+    to_add_texts = []
+    to_add_metas = []
+
+    # docごとに存在確認
     for d in docs:
-        idx = d.text.find(q)
-        if idx >= 0:
-            start = max(0, idx - 120)
-            end = min(len(d.text), idx + 400)
-            snippet = d.text[start:end]
-            hits.append(
+        doc_id = d["id"]
+        exists = False
+        try:
+            got = collection.get(ids=[doc_id])
+            if got and got.get("ids") and len(got["ids"]) > 0:
+                exists = True
+        except Exception:
+            # get(ids=) が失敗する実装もあるので、その場合は追加側で弾かれる想定
+            exists = False
+
+        if not exists:
+            text = (d.get("text") or "").strip()
+            if not text:
+                continue
+            to_add.append(d)
+            to_add_ids.append(doc_id)
+            to_add_texts.append(text)
+            to_add_metas.append(
                 {
-                    "doc_id": d.id,
-                    "filename": d.filename,
-                    "snippet": snippet,
-                    "pos": idx,
+                    "filename": d.get("filename", ""),
+                    "uploaded_at": d.get("uploaded_at", ""),
+                    "json_path": d.get("_path", ""),
                 }
             )
-    hits.sort(key=lambda x: x["pos"])
-    return hits[:limit]
 
-# -------------------------
-# 8) セッション初期化
-# -------------------------
-if "documents" not in st.session_state:
-    st.session_state.documents: List[Doc] = load_docs_from_disk()
+    if not to_add_ids:
+        return {"added": 0}
 
-# -------------------------
-# 9) サイドバー
-# -------------------------
+    embeddings = model.encode(to_add_texts).tolist()
+    collection.add(
+        ids=to_add_ids,
+        embeddings=embeddings,
+        documents=to_add_texts,
+        metadatas=to_add_metas,
+    )
+    return {"added": len(to_add_ids)}
+
+
+def search(query: str, n_results: int, collection, model) -> List[Dict[str, Any]]:
+    q_emb = model.encode([query]).tolist()
+    res = collection.query(query_embeddings=q_emb, n_results=n_results)
+
+    out: List[Dict[str, Any]] = []
+    ids = (res.get("ids") or [[]])[0]
+    docs = (res.get("documents") or [[]])[0]
+    metas = (res.get("metadatas") or [[]])[0]
+    dists = (res.get("distances") or [[]])[0]  # 小さいほど近い
+
+    for i in range(len(ids)):
+        out.append(
+            {
+                "id": ids[i],
+                "text": docs[i],
+                "metadata": metas[i] if i < len(metas) else {},
+                "distance": dists[i] if i < len(dists) else None,
+            }
+        )
+    return out
+
+
+# -----------------------------
+# Sidebar
+# -----------------------------
 with st.sidebar:
-    st.header("⚙️ 共有・検索モード（ルートC）")
-
-    st.markdown("**このアプリはCloud上でOCRしません。** 代わりにローカルで作ったOCR結果JSONを取り込みます。")
-
-    st.markdown("---")
-    st.subheader("RAG状態")
-    if CHROMADB_AVAILABLE:
-        st.success("✅ RAG（ChromaDB + Embedding）利用可能")
-        st.caption(f"Embedding: {EMBEDDING_MODEL_NAME}")
-    else:
-        st.warning("⚠️ RAGは未使用（簡易検索で動作）")
-        st.caption(f"理由: {CHROMA_IMPORT_ERROR}")
+    st.header("⚙️ Cloud検索専用（ルートC）")
+    st.write("✅ OCRはローカルで実施し、JSONをこのリポジトリへ配置します。")
+    st.write(f"📁 JSON読込先: `{OCR_RESULTS_DIR.as_posix()}`")
+    st.write(f"🧠 埋め込みモデル: `{EMBEDDING_MODEL_NAME}`")
+    st.write(f"🗄️ ChromaDB: `{VECTOR_DB_DIR.as_posix()}`")
 
     st.markdown("---")
-    st.subheader("保存データ")
-    st.write(f"JSON保存先: `{OCR_RESULTS_DIR.as_posix()}`")
-    st.write(f"保存済み文書数: **{len(st.session_state.documents)}**")
 
-    if st.button("🔄 ディスクから再読み込み"):
-        st.session_state.documents = load_docs_from_disk()
-        st.success("再読み込みしました")
+    if not CHROMA_OK:
+        st.error("ChromaDB / sentence-transformers がrequirementsに入っていません。")
+        st.stop()
+
+    if st.button("🔄 JSONを再読み込み＆再インデックス"):
+        # cacheを使っていても docs は毎回読むが、ユーザーに明示したいので rerun
+        st.session_state["_force_reindex"] = True
         st.rerun()
 
-# -------------------------
-# 10) メインUI
-# -------------------------
-st.title("📄 技術資料OCR・RAG検索（ルートC：JSON取り込み → 共有検索）")
-st.markdown("---")
+    st.markdown("---")
+    st.caption("※ Streamlit CloudのファイルはGitHubに置いたものが読まれます。")
 
-tab_upload, tab_search, tab_list = st.tabs(["📤 JSON取り込み", "🔍 検索", "📚 文書一覧"])
 
-# ========== Tab 1: JSON取り込み ==========
-with tab_upload:
-    st.header("📤 OCR結果JSONの取り込み（ローカルで作成したもの）")
+# -----------------------------
+# メイン処理
+# -----------------------------
+docs = load_json_documents(OCR_RESULTS_DIR)
 
-    st.markdown(
-        """
-- ローカルOCRで作った **JSON（1文書=1ファイル）** をアップロードしてください  
-- アップロード後、（RAGが有効なら）ベクトルDBにも登録できます
-"""
-    )
+tab_search, tab_docs, tab_status = st.tabs(["🔍 検索", "📚 JSON一覧", "🧪 状態/診断"])
 
-    st.subheader("JSONアップロード")
-    up = st.file_uploader("OCR結果JSON（.json）を選択", type=["json"], accept_multiple_files=True)
+with tab_status:
+    st.subheader("状態")
+    st.write(f"JSON件数: **{len(docs)}**")
+    if len(docs) == 0:
+        st.warning(
+            "まだJSONがありません。ローカルで `local_ocr_to_json.py` を実行してJSONを作成し、"
+            "`data/ocr_results/` に入れてGitHubへpushしてください。"
+        )
 
-    colA, colB = st.columns([1, 1])
-    with colA:
-        add_to_rag = st.checkbox("RAGにも登録する（おすすめ）", value=CHROMADB_AVAILABLE, disabled=not CHROMADB_AVAILABLE)
-    with colB:
-        save_disk = st.checkbox("サーバ側にJSONとして保存する", value=True, help="Cloudでは永続保証はありません（運用はアップロード推奨）")
+    st.write("Chroma/Model 初期化…")
+    try:
+        collection = get_chroma_collection(str(VECTOR_DB_DIR), VECTOR_DB_COLLECTION_NAME)
+        model = get_embedding_model(EMBEDDING_MODEL_NAME)
+        st.success("✅ ChromaDBと埋め込みモデルの初期化OK")
+    except Exception as e:
+        st.error(f"初期化失敗: {e}")
+        st.stop()
 
-    if up:
-        for f in up:
-            try:
-                obj = safe_load_json(f.getvalue())
-                ok, msg = validate_doc_json(obj)
-                if not ok:
-                    st.error(f"❌ {f.name}: {msg}")
-                    continue
-
-                doc = normalize_doc(obj)
-
-                # 同IDが既にある場合はスキップ（上書きしたいならIDを変える運用）
-                if any(d.id == doc.id for d in st.session_state.documents):
-                    st.warning(f"⚠️ {doc.id} は既に登録済みです（スキップ）")
-                    continue
-
-                st.session_state.documents.append(doc)
-
-                if save_disk:
-                    save_doc_to_disk(doc)
-
-                if add_to_rag and CHROMADB_AVAILABLE:
-                    ok2, msg2 = rag_add_doc(doc)
-                    if ok2:
-                        st.success(f"✅ {doc.filename}: {msg2}")
-                    else:
-                        st.warning(f"⚠️ {doc.filename}: {msg2}")
-                else:
-                    st.success(f"✅ {doc.filename}: 取り込みました")
-
-            except Exception as e:
-                st.error(f"❌ {f.name}: 読み込み失敗: {e}")
-
-        st.info("取り込み後は「検索」タブで検索できます。")
+    # 自動インデックス
+    if len(docs) > 0:
+        try:
+            force = st.session_state.pop("_force_reindex", False)
+            if force:
+                # force時は既存を消したいケースもあるが、ここでは追加のみ（安全）
+                st.info("再インデックス（追加）を実行します…")
+            result = ensure_indexed(docs, collection, model)
+            st.write(f"今回追加した件数: **{result.get('added', 0)}**")
+        except Exception as e:
+            st.error(f"インデックス失敗: {e}")
 
     st.markdown("---")
-    st.subheader("JSONフォーマット例（参考）")
-    example = {
-        "id": "doc_20260106_120000",
-        "filename": "技術資料A.pdf",
-        "text": "（OCRで抽出した本文テキスト…）",
-        "uploaded_at": datetime.now().isoformat(),
-        "ocr_settings": {
-            "source": "local_ocr",
-            "lang": "jpn",
-            "psm": 6,
-            "oem": 3
-        }
-    }
-    st.code(json.dumps(example, ensure_ascii=False, indent=2), language="json")
+    st.write("📌 ルートCではCloud側にTesseractは不要です（OCRはしません）。")
 
-# ========== Tab 2: 検索 ==========
+
+with tab_docs:
+    st.subheader("JSON一覧（data/ocr_results）")
+    if len(docs) == 0:
+        st.info("JSONがありません。まずローカルでJSON生成→GitHubへpushしてください。")
+    else:
+        for d in docs:
+            with st.expander(f"📄 {d.get('filename','')}  |  {d.get('id','')}"):
+                st.write(f"JSON: `{d.get('_path','')}`")
+                if d.get("uploaded_at"):
+                    st.write(f"日時: {d.get('uploaded_at')}")
+                st.write("テキスト（先頭500文字）:")
+                t = (d.get("text") or "")
+                st.text(t[:500] + ("..." if len(t) > 500 else ""))
+
+
 with tab_search:
-    st.header("🔍 検索（RAGまたは簡易検索）")
+    st.subheader("🔍 検索（RAGのRetrieval）")
 
-    if len(st.session_state.documents) == 0:
-        st.info("📝 まず「JSON取り込み」タブからOCR結果JSONを取り込んでください。")
-    else:
-        query = st.text_input("検索クエリ", placeholder="例：金型温度の設定、材料の強度、サーボ調整…")
-        n_results = st.slider("検索結果数", 1, MAX_SEARCH_RESULTS, DEFAULT_SEARCH_RESULTS)
+    if not CHROMA_OK:
+        st.stop()
 
-        if st.button("🔍 検索実行", type="primary") and query.strip():
-            if CHROMADB_AVAILABLE:
-                with st.spinner("RAG検索中..."):
-                    results = rag_search(query, n_results=n_results)
+    if len(docs) == 0:
+        st.info("まずJSONを `data/ocr_results/` に入れてGitHubへpushしてください。")
+        st.stop()
 
-                if results:
-                    st.subheader(f"検索結果（RAG）: {len(results)}件")
-                    for i, r in enumerate(results, 1):
-                        meta = r.get("metadata") or {}
-                        dist = r.get("distance")
-                        score = None
-                        if isinstance(dist, (int, float)):
-                            # Chromaは距離が小さいほど近い。見た目用にスコア化
-                            score = 1.0 / (1.0 + dist)
+    # 初期化
+    collection = get_chroma_collection(str(VECTOR_DB_DIR), VECTOR_DB_COLLECTION_NAME)
+    model = get_embedding_model(EMBEDDING_MODEL_NAME)
 
-                        title = f"結果 {i}: {meta.get('filename','(unknown)')} / doc={meta.get('doc_id','')}"
-                        if score is not None:
-                            title += f" / score≈{score:.3f}"
+    # 自動で未登録分を追加
+    try:
+        ensure_indexed(docs, collection, model)
+    except Exception as e:
+        st.error(f"インデックス処理でエラー: {e}")
+        st.stop()
 
-                        with st.expander(title):
-                            st.write("**メタデータ**")
-                            st.json(meta)
-                            st.write("**該当テキスト（chunk）**")
-                            st.text(r.get("text", ""))
-                else:
-                    st.info("検索結果が見つかりませんでした（RAG）")
-                    st.caption("※ 取り込み直後は、RAG登録に失敗している可能性があります。JSON取り込みタブで「RAGにも登録」にチェックして再取り込みしてください。")
-            else:
-                with st.spinner("簡易検索中..."):
-                    hits = simple_search(st.session_state.documents, query, limit=n_results)
+    query = st.text_input("検索クエリ", placeholder="例：工程異常の原因、材料の特性、設備点検…")
+    n_results = st.slider("検索結果数", 1, int(MAX_SEARCH_RESULTS), int(DEFAULT_SEARCH_RESULTS))
 
-                if hits:
-                    st.subheader(f"検索結果（簡易）: {len(hits)}件")
-                    for i, h in enumerate(hits, 1):
-                        with st.expander(f"結果 {i}: {h['filename']} / doc={h['doc_id']}"):
-                            st.text(h["snippet"])
-                else:
-                    st.info("検索結果が見つかりませんでした（簡易）")
+    if st.button("🔎 検索", type="primary") and query.strip():
+        with st.spinner("検索中…"):
+            results = search(query.strip(), n_results, collection, model)
 
-# ========== Tab 3: 文書一覧 ==========
-with tab_list:
-    st.header("📚 保存済み文書一覧")
+        if not results:
+            st.info("検索結果が見つかりませんでした。")
+        else:
+            st.success(f"検索結果: {len(results)}件")
+            for i, r in enumerate(results, 1):
+                dist = r.get("distance")
+                score = None if dist is None else (1.0 / (1.0 + float(dist)))  # ざっくり表示
+                title = f"{i}. {r.get('id','')}"
+                if score is not None:
+                    title += f"  |  近さ目安: {score:.3f}"
 
-    if len(st.session_state.documents) == 0:
-        st.info("📝 文書がありません。JSON取り込みを行ってください。")
-    else:
-        st.write(f"**文書数: {len(st.session_state.documents)}**")
-
-        for doc in st.session_state.documents:
-            with st.expander(f"📄 {doc.filename}（{doc.id}）"):
-                st.write(f"**uploaded_at:** {doc.uploaded_at}")
-                st.write(f"**文字数:** {len(doc.text)}")
-
-                # プレビュー
-                preview = doc.text[:800] + ("..." if len(doc.text) > 800 else "")
-                st.text(preview)
-
-                c1, c2, c3 = st.columns([1, 1, 2])
-
-                with c1:
-                    # JSONダウンロード
-                    st.download_button(
-                        "⬇️ JSONをダウンロード",
-                        data=json.dumps(doc.meta, ensure_ascii=False, indent=2).encode("utf-8"),
-                        file_name=f"{doc.id}.json",
-                        mime="application/json",
-                        key=f"dl_{doc.id}",
-                    )
-
-                with c2:
-                    if CHROMADB_AVAILABLE:
-                        if st.button("🧠 RAGに登録", key=f"rag_add_{doc.id}"):
-                            ok, msg = rag_add_doc(doc)
-                            (st.success if ok else st.warning)(msg)
-
-                with c3:
-                    if st.button("🗑️ 削除（ローカル保存分も）", key=f"del_{doc.id}"):
-                        # セッションから削除
-                        st.session_state.documents = [d for d in st.session_state.documents if d.id != doc.id]
-
-                        # ディスクJSON削除
-                        delete_doc_files(doc.id)
-
-                        # RAG削除
-                        if CHROMADB_AVAILABLE:
-                            rag_delete_doc(doc.id)
-
-                        st.success("削除しました")
-                        st.rerun()
-
-
+                with st.expander(title):
+                    st.write("メタデータ")
+                    st.json(r.get("metadata") or {})
+                    st.write("本文（先頭800文字）")
+                    txt = r.get("text") or ""
+                    st.text(txt[:800] + ("..." if len(txt) > 800 else ""))
 
