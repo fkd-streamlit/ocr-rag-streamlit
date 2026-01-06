@@ -41,4 +41,3 @@ MAX_SEARCH_RESULTS = 10
 # Streamlit設定
 PAGE_TITLE = "技術資料OCR・RAG検索"
 PAGE_ICON = "📄"
-
