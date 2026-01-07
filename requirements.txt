@@ -1,11 +1,15 @@
 # Streamlit Cloud用（app.pyで使用）
 # このファイルはStreamlit Cloudでデプロイする際に使用されます
-# 
-# 重要: app.pyはpdf2imageやpytesseractを使用しません
-# OCRはローカルで実行し、JSONファイルのみを読み込みます
 #
+# 基本ライブラリ（必須）
 streamlit>=1.28.0
 scikit-learn>=1.3.0
+
+# OCR機能用（オプション - ローカルでPDF/画像アップロードしてOCRを実行する場合）
+# Streamlit Cloudでは packages.txt で tesseract-ocr と poppler-utils が必要です
+# Pillow>=10.0.0
+# pdf2image>=1.16.0
+# pytesseract>=0.3.10
 
 
 

@@ -11,11 +11,27 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import streamlit as st
+
+# OCR関連のインポート（オプション）
+try:
+    from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+    import pytesseract
+    PIL_OK = True
+except ImportError:
+    PIL_OK = False
+
+try:
+    from pdf2image import convert_from_path, pdfinfo_from_path
+    PDF2IMAGE_OK = True
+except ImportError:
+    PDF2IMAGE_OK = False
 
 
 # ----------------------------
@@ -29,15 +45,149 @@ DEFAULT_TOPK = 5
 # config.pyから読み込もうとしますが、存在しない場合はデフォルト値を使用
 MAX_JSON_FILE_SIZE_MB = 100
 MAX_TOTAL_CHUNKS = 50000
+MAX_PDF_FILE_SIZE_MB = 500
+MAX_PDF_PAGES = 1000
 
 # config.pyが存在する場合は上書き（オプション）
 try:
     import config
     MAX_JSON_FILE_SIZE_MB = getattr(config, 'MAX_JSON_FILE_SIZE_MB', MAX_JSON_FILE_SIZE_MB)
     MAX_TOTAL_CHUNKS = getattr(config, 'MAX_TOTAL_CHUNKS', MAX_TOTAL_CHUNKS)
+    MAX_PDF_FILE_SIZE_MB = getattr(config, 'MAX_PDF_FILE_SIZE_MB', MAX_PDF_FILE_SIZE_MB)
+    MAX_PDF_PAGES = getattr(config, 'MAX_PDF_PAGES', MAX_PDF_PAGES)
 except (ImportError, AttributeError, Exception):
     # config.pyが存在しない、またはエラーが発生した場合はデフォルト値を使用
     pass
+
+
+# ----------------------------
+# OCR機能（オプション）
+# ----------------------------
+def check_tesseract_available() -> Tuple[bool, str]:
+    """Tesseractが利用可能かチェック"""
+    if not PIL_OK:
+        return False, "PIL/Pillowがインストールされていません"
+    try:
+        pytesseract.get_tesseract_version()
+        return True, "Tesseract利用可能"
+    except Exception as e:
+        return False, f"Tesseractが見つかりません: {e}"
+
+def preprocess_pil(img: Image.Image, contrast: float = 1.3, sharpen: bool = True) -> Image.Image:
+    """画像前処理"""
+    if not PIL_OK:
+        raise ImportError("PIL/Pillowがインストールされていません")
+    x = img.convert("RGB")
+    x = ImageOps.grayscale(x)
+    x = ImageOps.autocontrast(x)
+    if contrast and contrast != 1.0:
+        x = ImageEnhance.Contrast(x).enhance(contrast)
+    if sharpen:
+        x = x.filter(ImageFilter.SHARPEN)
+    return x
+
+def ocr_image(img: Image.Image, lang: str = "jpn+eng", psm: int = 6, oem: int = 3) -> str:
+    """画像からOCR実行"""
+    if not PIL_OK:
+        raise ImportError("PIL/Pillowがインストールされていません")
+    config_str = f"--oem {oem} --psm {psm} -l {lang}"
+    return pytesseract.image_to_string(img, config=config_str)
+
+def check_pdf_limits(pdf_bytes: bytes) -> Tuple[bool, str]:
+    """PDFファイルの容量をチェック"""
+    file_size_mb = len(pdf_bytes) / (1024 * 1024)
+    if file_size_mb > MAX_PDF_FILE_SIZE_MB:
+        return False, f"PDFファイルサイズが上限を超えています: {file_size_mb:.1f}MB > {MAX_PDF_FILE_SIZE_MB}MB"
+    
+    if not PDF2IMAGE_OK:
+        return False, "pdf2imageがインストールされていません"
+    
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = Path(tmp.name)
+        
+        try:
+            info = pdfinfo_from_path(str(tmp_path))
+            total_pages = int(info.get("Pages", 0))
+            if total_pages > MAX_PDF_PAGES:
+                return False, f"PDFページ数が上限を超えています: {total_pages}ページ > {MAX_PDF_PAGES}ページ"
+            return True, f"OK: {file_size_mb:.1f}MB, {total_pages}ページ"
+        finally:
+            tmp_path.unlink()
+    except Exception as e:
+        return False, f"PDF情報の取得に失敗しました: {e}"
+
+def process_pdf_upload(pdf_bytes: bytes, filename: str, dpi: int = 200, lang: str = "jpn+eng", 
+                       psm: int = 6, oem: int = 3, progress_callback=None) -> Dict[str, Any]:
+    """アップロードされたPDFをOCR処理"""
+    if not PDF2IMAGE_OK:
+        raise RuntimeError("pdf2imageがインストールされていません。pip install pdf2image")
+    if not PIL_OK:
+        raise RuntimeError("PIL/Pillowがインストールされていません")
+    
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = Path(tmp.name)
+    
+    try:
+        started = time.time()
+        pages = []
+        
+        # PDF情報取得
+        info = pdfinfo_from_path(str(tmp_path))
+        total_pages = int(info.get("Pages", 0))
+        
+        # 1ページずつ処理
+        for p_no in range(1, total_pages + 1):
+            images = convert_from_path(str(tmp_path), dpi=dpi, first_page=p_no, last_page=p_no)
+            for img in images:
+                proc = preprocess_pil(img)
+                text = ocr_image(proc, lang=lang, psm=psm, oem=oem)
+                pages.append({
+                    "page": p_no,
+                    "text": text,
+                    "metadata": {"dpi": dpi, "lang": lang, "preprocess": ["grayscale", "autocontrast", "sharpen"]}
+                })
+                
+                if progress_callback:
+                    progress_callback(p_no, total_pages)
+        
+        return {
+            "doc_id": Path(filename).stem,
+            "title": filename,
+            "source": filename,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "pages": pages,
+            "elapsed_sec": round(time.time() - started, 3)
+        }
+    finally:
+        tmp_path.unlink()
+
+def process_image_upload(img_bytes: bytes, filename: str, lang: str = "jpn+eng", 
+                        psm: int = 6, oem: int = 3) -> Dict[str, Any]:
+    """アップロードされた画像をOCR処理"""
+    if not PIL_OK:
+        raise RuntimeError("PIL/Pillowがインストールされていません")
+    
+    import io
+    img = Image.open(io.BytesIO(img_bytes))
+    proc = preprocess_pil(img)
+    text = ocr_image(proc, lang=lang, psm=psm, oem=oem)
+    
+    return {
+        "doc_id": Path(filename).stem,
+        "title": filename,
+        "source": filename,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "pages": [{
+            "page": 1,
+            "text": text,
+            "metadata": {"dpi": None, "lang": lang, "preprocess": ["grayscale", "autocontrast", "sharpen"]}
+        }]
+    }
 
 
 # ----------------------------
@@ -240,6 +390,110 @@ st.title("📄 OCR RAG（ローカルOCR→JSON→検索）")
 with st.sidebar:
     st.header("設定")
     st.write("検索対象： `data/ocr_results/*.json`")
+    
+    # PDF/画像アップロードとOCR実行機能
+    st.subheader("📄 PDF/画像をアップロードしてOCR")
+    ocr_available, ocr_msg = check_tesseract_available()
+    
+    if not ocr_available:
+        st.warning(f"⚠️ OCR機能は利用できません: {ocr_msg}")
+        st.info("💡 ローカルで実行する場合は、以下をインストールしてください:\n- Tesseract OCR\n- Poppler (PDF用)\n- pip install pillow pdf2image pytesseract")
+    else:
+        st.success(f"✅ {ocr_msg}")
+        
+        uploaded_pdf = st.file_uploader(
+            "PDFファイルをアップロード",
+            type=["pdf"],
+            help="PDFファイルをアップロードしてOCRを実行します"
+        )
+        
+        uploaded_image = st.file_uploader(
+            "画像ファイルをアップロード",
+            type=["png", "jpg", "jpeg", "tiff", "tif"],
+            help="画像ファイルをアップロードしてOCRを実行します"
+        )
+        
+        if uploaded_pdf or uploaded_image:
+            # OCR設定
+            with st.expander("OCR設定", expanded=False):
+                dpi = st.number_input("DPI (PDF用)", min_value=100, max_value=600, value=200, step=50)
+                lang = st.selectbox("言語", ["jpn", "jpn+eng", "eng"], index=1)
+                psm = st.number_input("PSM (Page Segmentation Mode)", min_value=0, max_value=13, value=6)
+                oem = st.number_input("OEM (OCR Engine Mode)", min_value=0, max_value=3, value=3)
+            
+            if st.button("🚀 OCR実行", type="primary"):
+                if uploaded_pdf:
+                    with st.spinner("PDFを処理中..."):
+                        try:
+                            pdf_bytes = uploaded_pdf.getvalue()
+                            # 容量チェック
+                            is_valid, msg = check_pdf_limits(pdf_bytes)
+                            if not is_valid:
+                                st.error(f"❌ {msg}")
+                            else:
+                                st.info(f"📄 {msg}")
+                                
+                                progress_bar = st.progress(0)
+                                status_text = st.empty()
+                                
+                                def progress_callback(current, total):
+                                    progress_bar.progress(current / total)
+                                    status_text.text(f"処理中: {current}/{total}ページ")
+                                
+                                result = process_pdf_upload(
+                                    pdf_bytes, uploaded_pdf.name, dpi=dpi, 
+                                    lang=lang, psm=psm, oem=oem,
+                                    progress_callback=progress_callback
+                                )
+                                
+                                # JSONとして保存
+                                json_filename = f"{Path(uploaded_pdf.name).stem}.json"
+                                save_path = OCR_RESULTS_DIR / json_filename
+                                OCR_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                                
+                                with save_path.open("w", encoding="utf-8") as f:
+                                    json.dump(result, f, ensure_ascii=False, indent=2)
+                                
+                                progress_bar.empty()
+                                status_text.empty()
+                                st.success(f"✅ OCR完了: {len(result['pages'])}ページ → {json_filename}")
+                                
+                                # セッション状態をリセット
+                                if "chunks" in st.session_state:
+                                    del st.session_state["chunks"]
+                        except Exception as e:
+                            st.error(f"❌ OCR処理エラー: {e}")
+                            import traceback
+                            st.code(traceback.format_exc())
+                
+                if uploaded_image:
+                    with st.spinner("画像を処理中..."):
+                        try:
+                            img_bytes = uploaded_image.getvalue()
+                            result = process_image_upload(
+                                img_bytes, uploaded_image.name,
+                                lang=lang, psm=psm, oem=oem
+                            )
+                            
+                            # JSONとして保存
+                            json_filename = f"{Path(uploaded_image.name).stem}.json"
+                            save_path = OCR_RESULTS_DIR / json_filename
+                            OCR_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                            
+                            with save_path.open("w", encoding="utf-8") as f:
+                                json.dump(result, f, ensure_ascii=False, indent=2)
+                            
+                            st.success(f"✅ OCR完了: {json_filename}")
+                            
+                            # セッション状態をリセット
+                            if "chunks" in st.session_state:
+                                del st.session_state["chunks"]
+                        except Exception as e:
+                            st.error(f"❌ OCR処理エラー: {e}")
+                            import traceback
+                            st.code(traceback.format_exc())
+    
+    st.divider()
     
     # JSONファイルアップロード機能
     st.subheader("📤 JSONファイルをアップロード")
