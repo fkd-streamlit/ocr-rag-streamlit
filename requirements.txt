@@ -1,9 +1,11 @@
 streamlit
-pdf2image
+pytesseract
 Pillow
 opencv-python-headless
-pytesseract
 numpy
+PyMuPDF
+scikit-learn
+
 
 
 
