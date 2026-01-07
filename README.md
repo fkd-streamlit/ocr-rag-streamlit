@@ -68,6 +68,15 @@ Streamlit Cloud では **Tesseract のインストールや日本語学習デー
 2) **Poppler（PDF→画像変換用）**
 - Poppler をインストールして `bin` を PATH に追加
 
+- ## 使い方（3ステップ）
+
+1. PDFまたは画像をアップロード
+2. サイドバーでOCR精度を調整（必要に応じて）
+3. 検索キーワードを入力して結果を確認
+
+※ ユーザー側にソフトのインストールは不要です。
+
+
 #### Pythonパッケージ（ローカル用）
 ```bash
 pip install pillow pdf2image pytesseract opencv-python
