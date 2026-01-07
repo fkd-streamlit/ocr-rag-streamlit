@@ -1,0 +1,5 @@
+# Streamlit Cloud用の最小限のrequirements.txt
+# app.pyで実際に使用されるライブラリのみ
+
+streamlit>=1.28.0
+scikit-learn>=1.3.0

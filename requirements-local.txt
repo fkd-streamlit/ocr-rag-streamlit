@@ -1,0 +1,12 @@
+# ローカルOCR実行用のrequirements.txt
+# local_ocr_to_json.pyで使用されるライブラリを含む
+
+# Streamlit Cloud用（app.pyで使用）
+streamlit>=1.28.0
+scikit-learn>=1.3.0
+
+# ローカルOCR用（local_ocr_to_json.pyで使用）
+pytesseract>=0.3.10
+pdf2image>=1.16.0
+Pillow>=10.0.0
+opencv-python-headless>=4.8.0
