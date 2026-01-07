@@ -1,230 +1,106 @@
-# app.py
-"""
-技術資料OCR・RAG検索アプリケーション
-- PDF/画像ファイルをアップロードしてOCR処理
-- 画像前処理（コントラスト、明度、閾値処理）をリアルタイムで調整可能
-- OCR精度調整（PSM、OEM）
-- OCR結果をベクトルDBに保存してRAG検索可能に
-"""
 
+# app.py （安定版：Cloudは検索専用）
 from __future__ import annotations
-
-import json
-import os
-import shutil
+import io, json, os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import cv2
-import numpy as np
-import pytesseract
 import streamlit as st
-from PIL import Image
 
-# PDF処理
+# ---- オプション：埋め込みモデル（軽量）とChromaDB ----
+EMBED_OK = True
+EMBED_ERR = ""
 try:
-    from pdf2image import convert_from_path
-    PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+except Exception as e:
+    EMBED_OK = False
+    EMBED_ERR = str(e)
+    SentenceTransformer = None
+    np = None
 
-# -------------------------
-# 0) 設定（config.py があれば優先）
-# -------------------------
-try:
-    from config import (
-        DATA_DIR,
-        UPLOADS_DIR,
-        OCR_RESULTS_DIR,
-        VECTOR_DB_DIR,
-        TESSERACT_LANG,
-        TESSERACT_PSM_DEFAULT,
-        TESSERACT_OEM_DEFAULT,
-        PDF_DPI,
-        DEFAULT_CONTRAST,
-        DEFAULT_BRIGHTNESS,
-        DEFAULT_THRESHOLD,
-        DEFAULT_USE_ADAPTIVE,
-        VECTOR_DB_COLLECTION_NAME,
-        EMBEDDING_MODEL_NAME,
-        DEFAULT_SEARCH_RESULTS,
-        MAX_SEARCH_RESULTS,
-        PAGE_TITLE,
-        PAGE_ICON,
-    )
-except Exception:
-    BASE_DIR = Path(__file__).parent
-    DATA_DIR = BASE_DIR / "data"
-    UPLOADS_DIR = DATA_DIR / "uploads"
-    OCR_RESULTS_DIR = DATA_DIR / "ocr_results"
-    VECTOR_DB_DIR = DATA_DIR / "chroma_db"
-    TESSERACT_LANG = 'jpn'
-    TESSERACT_PSM_DEFAULT = 6
-    TESSERACT_OEM_DEFAULT = 3
-    PDF_DPI = 300
-    DEFAULT_CONTRAST = 1.0
-    DEFAULT_BRIGHTNESS = 0
-    DEFAULT_THRESHOLD = 127
-    DEFAULT_USE_ADAPTIVE = False
-    VECTOR_DB_COLLECTION_NAME = "technical_documents"
-    EMBEDDING_MODEL_NAME = "paraphrase-multilingual-mpnet-base-v2"
-    DEFAULT_SEARCH_RESULTS = 5
-    MAX_SEARCH_RESULTS = 10
-    PAGE_TITLE = "技術資料OCR・RAG検索"
-    PAGE_ICON = "📄"
-
-# ディレクトリ作成
-for dir_path in [DATA_DIR, UPLOADS_DIR, OCR_RESULTS_DIR, VECTOR_DB_DIR]:
-    dir_path.mkdir(parents=True, exist_ok=True)
-
-# -------------------------
-# 1) Tesseract OCR設定
-# -------------------------
-def find_tesseract_cmd() -> Optional[str]:
-    """Tesseractのパスを検出（Windows/Linux対応）"""
-    # 環境変数から取得
-    if os.environ.get("TESSERACT_CMD"):
-        return os.environ.get("TESSERACT_CMD")
-    
-    # Windowsのデフォルトパス
-    windows_paths = [
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-    ]
-    for path in windows_paths:
-        if os.path.exists(path):
-            return path
-    
-    # Linux/Mac: whichコマンドで検索
-    tesseract_cmd = shutil.which("tesseract")
-    if tesseract_cmd:
-        return tesseract_cmd
-    
-    return None
-
-TESSERACT_CMD = find_tesseract_cmd()
-if TESSERACT_CMD:
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
-
-# -------------------------
-# 2) RAG依存の読み込み（あれば使う）
-# -------------------------
-CHROMADB_AVAILABLE = True
-CHROMA_IMPORT_ERROR = ""
-
+CHROMA_OK = True
+CHROMA_ERR = ""
 try:
     import chromadb
-    from sentence_transformers import SentenceTransformer
 except Exception as e:
-    CHROMADB_AVAILABLE = False
-    CHROMA_IMPORT_ERROR = str(e)
+    CHROMA_OK = False
+    CHROMA_ERR = str(e)
 
-# -------------------------
-# 3) UI設定
-# -------------------------
-st.set_page_config(
-    page_title=PAGE_TITLE,
-    page_icon=PAGE_ICON,
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# ---- ページ設定 ----
+PAGE_TITLE = "技術資料 OCR・RAG 検索（Cloud：検索専用）"
+PAGE_ICON = "📄"
+st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="wide")
 
-# -------------------------
-# 4) データ構造
-# -------------------------
+# ---- データ構造 ----
 @dataclass
 class Doc:
     id: str
-    filename: str
+    title: str
+    source: str
     text: str
     uploaded_at: str
-    meta: Dict[str, Any]
 
-def now_id(prefix: str = "doc") -> str:
-    return f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+# ---- セッション初期化（辞書アクセスで安全に）----
+if "docs" not in st.session_state:
+    st.session_state["docs"]: List[Doc] = []
+if "index" not in st.session_state:
+    st.session_state["index"] = None
+if "doc_title" not in st.session_state:
+    st.session_state["doc_title"] = None
 
-# -------------------------
-# 5) 画像前処理
-# -------------------------
-def preprocess_image(
-    image: np.ndarray,
-    contrast: float = 1.0,
-    brightness: int = 0,
-    threshold: int = 127,
-    use_adaptive: bool = False,
-) -> np.ndarray:
-    """画像前処理（コントラスト、明度、閾値処理）"""
-    img = image.copy()
-    
-    # コントラスト調整
-    if contrast != 1.0:
-        img = cv2.convertScaleAbs(img, alpha=contrast, beta=0)
-    
-    # 明度調整
-    if brightness != 0:
-        img = cv2.convertScaleAbs(img, alpha=1.0, beta=brightness)
-    
-    # グレースケール変換
-    if len(img.shape) == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # 閾値処理
-    if use_adaptive:
-        img = cv2.adaptiveThreshold(
-            img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
-        )
-    else:
-        _, img = cv2.threshold(img, threshold, 255, cv2.THRESH_BINARY)
-    
-    return img
+# ---- JSON読み込み ----
+def load_json_from_upload(file) -> Optional[Dict]:
+    try:
+        return json.load(io.BytesIO(file.getvalue()))
+    except Exception as e:
+        st.error(f"JSON読み込みエラー: {e}")
+        return None
 
-# -------------------------
-# 6) OCR実行
-# -------------------------
-def perform_ocr(
-    image: np.ndarray,
-    lang: str = TESSERACT_LANG,
-    psm: int = TESSERACT_PSM_DEFAULT,
-    oem: int = TESSERACT_OEM_DEFAULT,
-) -> str:
-    """Tesseract OCRでテキスト抽出"""
-    if TESSERACT_CMD is None:
-        raise RuntimeError(
-            "Tesseract OCRが見つかりません。\n"
-            "Windows: C:\\Program Files\\Tesseract-OCR\\tesseract.exe にインストールしてください。\n"
-            "Linux/Mac: sudo apt-get install tesseract-ocr tesseract-ocr-jpn を実行してください。\n"
-            "または環境変数 TESSERACT_CMD にパスを設定してください。"
-        )
-    
-    config = f"--psm {psm} --oem {oem} -l {lang}"
-    text = pytesseract.image_to_string(image, config=config)
-    return text.strip()
+def load_json_from_url(url: str) -> Optional[Dict]:
+    try:
+        import requests
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        st.error(f"URLロード失敗: {e}")
+        return None
 
-# -------------------------
-# 7) PDF処理
-# -------------------------
-def pdf_to_images(pdf_path: Path, dpi: int = PDF_DPI) -> List[Image.Image]:
-    """PDFを画像に変換"""
-    if not PDF_AVAILABLE:
-        raise RuntimeError("pdf2imageがインストールされていません。pip install pdf2image poppler-utils")
-    
-    images = convert_from_path(str(pdf_path), dpi=dpi)
-    return images
+# ---- スキーマ検証（local_ocr_to_json.py の出力に合わせる）----
+def validate_schema(doc: Dict) -> bool:
+    # 許容トップキー：doc_id/title/source/created_at/pages
+    if not isinstance(doc, dict):
+        st.error("JSONのトップが辞書ではありません。"); return False
+    for k in ["pages"]:
+        if k not in doc:
+            st.error(f"キーが不足: {k}"); return False
+    if not isinstance(doc["pages"], list) or len(doc["pages"]) == 0:
+        st.error("pages が空です。"); return False
+    # pages[*].page_num と text を必須化
+    for p in doc["pages"]:
+        if "text" not in p:
+            st.error("pages[*].text がありません。"); return False
+        if "page_num" not in p and "page" not in p:
+            st.error("pages[*].page_num（または page）がありません。"); return False
+    return True
 
-# -------------------------
-# 8) テキスト分割（RAG用 chunking）
-# -------------------------
-def chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> List[str]:
-    """シンプルな文字数ベース分割（日本語向けに安定）"""
-    text = text.replace("\r\n", "\n")
-    if len(text) <= chunk_size:
-        return [text]
-    
-    chunks: List[str] = []
-    i = 0
+# ---- テキスト結合 ----
+def join_text(doc: Dict) -> str:
+    buf = []
+    for p in doc["pages"]:
+        page_no = p.get("page_num", p.get("page", None))
+        t = p.get("text", "")
+        buf.append(f"=== ページ {page_no} ===\n{t}\n")
+    return "\n".join(buf)
+
+# ---- チャンク化 ----
+def chunk_text(text: str, chunk_size=1000, overlap=200) -> List[str]:
+    chunks = []
     n = len(text)
+    i = 0
     while i < n:
         j = min(i + chunk_size, n)
         chunk = text[i:j].strip()
@@ -235,510 +111,155 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 120) -> List[str
         i = max(0, j - overlap)
     return chunks
 
-# -------------------------
-# 9) RAG（ChromaDB）
-# -------------------------
-@st.cache_resource
-def get_embedding_model() -> Optional["SentenceTransformer"]:
-    if not CHROMADB_AVAILABLE:
-        return None
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
+# ---- 1) TF-IDF インメモリ検索（超軽量／デフォルト）----
+class TfIdfIndex:
+    def __init__(self):
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        self.vectorizer = TfidfVectorizer()
+        self.texts: List[str] = []
+        self.metas: List[Dict] = []
+        self.matrix = None
 
-@st.cache_resource
-def get_chroma_collection():
-    if not CHROMADB_AVAILABLE:
-        return None
-    # 新しいChromaDBクライアント構築方法
-    client = chromadb.PersistentClient(path=str(VECTOR_DB_DIR))
-    try:
-        col = client.get_collection(VECTOR_DB_COLLECTION_NAME)
-    except Exception:
-        col = client.create_collection(VECTOR_DB_COLLECTION_NAME)
-    return col
+    def add(self, texts: List[str], metas: List[Dict]):
+        self.texts.extend(texts)
+        self.metas.extend(metas)
+        self.matrix = self.vectorizer.fit_transform(self.texts)
 
-def rag_add_doc(doc: Doc) -> Tuple[bool, str]:
-    """1文書を chunk に分解してベクトルDBに追加"""
-    if not CHROMADB_AVAILABLE:
-        return False, "ChromaDB/SentenceTransformers が未導入です"
-    
-    model = get_embedding_model()
-    col = get_chroma_collection()
-    if model is None or col is None:
-        return False, "RAG初期化に失敗しました"
-    
-    chunks = chunk_text(doc.text)
-    ids = [f"{doc.id}__c{i:04d}" for i in range(len(chunks))]
-    metadatas = []
-    for i in range(len(chunks)):
-        metadatas.append(
-            {
-                "doc_id": doc.id,
-                "chunk_index": i,
-                "filename": doc.filename,
-                "uploaded_at": doc.uploaded_at,
-            }
-        )
-    
-    try:
-        emb = model.encode(chunks).tolist()
-        col.add(ids=ids, embeddings=emb, documents=chunks, metadatas=metadatas)
-        return True, f"RAGに登録しました（chunks={len(chunks)}）"
-    except Exception as e:
-        return False, f"RAG登録エラー: {e}"
+    def search(self, query: str, top_k=5):
+        if self.matrix is None or not self.texts:
+            return []
+        qv = self.vectorizer.transform([query])
+        scores = (self.matrix @ qv.T).toarray().ravel()
+        idx = scores.argsort()[::-1][:top_k]
+        results = []
+        for i in idx:
+            results.append({
+                "score": float(scores[i]),
+                "text": self.texts[i],
+                "meta": self.metas[i]
+            })
+        return results
 
-def rag_delete_doc(doc_id: str) -> Tuple[bool, str]:
-    if not CHROMADB_AVAILABLE:
-        return False, "ChromaDB未導入"
-    col = get_chroma_collection()
-    if col is None:
-        return False, "コレクション取得失敗"
-    
-    try:
-        all_ids = col.get(include=["metadatas"]).get("ids", [])
-        all_metas = col.get(include=["metadatas"]).get("metadatas", [])
-        del_ids = []
-        for _id, m in zip(all_ids, all_metas):
-            if isinstance(m, dict) and m.get("doc_id") == doc_id:
-                del_ids.append(_id)
-        if del_ids:
-            col.delete(ids=del_ids)
-        return True, f"RAGから削除しました（{len(del_ids)}件）"
-    except Exception as e:
-        return False, f"RAG削除エラー: {e}"
+# ---- 2) Sentence-Transformers 検索（軽量埋め込み／任意）----
+class EmbeddingIndex:
+    def __init__(self, model_name="paraphrase-multilingual-MiniLM-L12-v2"):
+        if not EMBED_OK:
+            raise RuntimeError(f"sentence-transformers の読み込みに失敗: {EMBED_ERR}")
+        self.model = SentenceTransformer(model_name)
+        self.texts: List[str] = []
+        self.metas: List[Dict] = []
+        self.embeds = None  # np.ndarray
 
-def rag_search(query: str, n_results: int = 5) -> List[Dict[str, Any]]:
-    if not CHROMADB_AVAILABLE:
-        return []
-    
-    model = get_embedding_model()
-    col = get_chroma_collection()
-    if model is None or col is None:
-        return []
-    
-    try:
-        qemb = model.encode([query]).tolist()
-        res = col.query(query_embeddings=qemb, n_results=n_results, include=["documents", "metadatas", "distances", "ids"])
-        out: List[Dict[str, Any]] = []
-        if res and res.get("ids") and len(res["ids"][0]) > 0:
-            for i in range(len(res["ids"][0])):
-                out.append(
-                    {
-                        "id": res["ids"][0][i],
-                        "text": res["documents"][0][i],
-                        "metadata": res["metadatas"][0][i],
-                        "distance": res["distances"][0][i] if res.get("distances") else None,
-                    }
-                )
-        return out
-    except Exception:
-        return []
-
-# -------------------------
-# 10) 簡易検索（RAGが無いとき）
-# -------------------------
-def simple_search(docs: List[Doc], query: str, limit: int = 5) -> List[Dict[str, Any]]:
-    q = query.strip()
-    if not q:
-        return []
-    hits = []
-    for d in docs:
-        idx = d.text.find(q)
-        if idx >= 0:
-            start = max(0, idx - 120)
-            end = min(len(d.text), idx + 400)
-            snippet = d.text[start:end]
-            hits.append(
-                {
-                    "doc_id": d.id,
-                    "filename": d.filename,
-                    "snippet": snippet,
-                    "pos": idx,
-                }
-            )
-    hits.sort(key=lambda x: x["pos"])
-    return hits[:limit]
-
-# -------------------------
-# 11) セッション初期化
-# -------------------------
-if "documents" not in st.session_state:
-    st.session_state.documents: List[Doc] = []
-
-if "processed_images" not in st.session_state:
-    st.session_state.processed_images: Dict[str, np.ndarray] = {}
-
-# -------------------------
-# 12) サイドバー（画像前処理設定）
-# -------------------------
-with st.sidebar:
-    st.header("⚙️ OCR設定")
-    
-    # Tesseract状態
-    st.subheader("Tesseract OCR")
-    if TESSERACT_CMD:
-        st.success(f"✅ Tesseract検出: {TESSERACT_CMD}")
-    else:
-        st.error("❌ Tesseract OCRが見つかりません")
-        st.caption("Windows: C:\\Program Files\\Tesseract-OCR\\tesseract.exe にインストール")
-        st.caption("Linux/Mac: sudo apt-get install tesseract-ocr tesseract-ocr-jpn")
-    
-    st.markdown("---")
-    
-    # 画像前処理設定
-    st.subheader("📸 画像前処理")
-    contrast = st.slider("コントラスト", 0.5, 2.0, DEFAULT_CONTRAST, 0.1)
-    brightness = st.slider("明度", -100, 100, DEFAULT_BRIGHTNESS, 5)
-    threshold = st.slider("閾値", 0, 255, DEFAULT_THRESHOLD, 1)
-    use_adaptive = st.checkbox("適応的閾値処理", DEFAULT_USE_ADAPTIVE)
-    
-    st.markdown("---")
-    
-    # OCR設定
-    st.subheader("🔍 OCR設定")
-    lang = st.selectbox("言語", ["jpn", "eng", "jpn+eng"], index=0)
-    psm = st.slider("PSM (Page Segmentation Mode)", 0, 13, TESSERACT_PSM_DEFAULT, 1)
-    st.caption("6: 単一の均一なテキストブロック（推奨）")
-    oem = st.slider("OEM (OCR Engine Mode)", 0, 3, TESSERACT_OEM_DEFAULT, 1)
-    st.caption("3: デフォルトエンジン（推奨）")
-    
-    st.markdown("---")
-    
-    # RAG状態
-    st.subheader("RAG状態")
-    if CHROMADB_AVAILABLE:
-        st.success("✅ RAG（ChromaDB + Embedding）利用可能")
-        st.caption(f"Embedding: {EMBEDDING_MODEL_NAME}")
-    else:
-        st.warning("⚠️ RAGは未使用（簡易検索で動作）")
-        st.caption(f"理由: {CHROMA_IMPORT_ERROR}")
-    
-    st.markdown("---")
-    
-    # 保存データ
-    st.subheader("保存データ")
-    st.write(f"保存済み文書数: **{len(st.session_state.documents)}**")
-
-# -------------------------
-# 13) メインUI
-# -------------------------
-st.title(f"{PAGE_ICON} {PAGE_TITLE}")
-st.markdown("---")
-
-tab_upload, tab_search, tab_list = st.tabs(["📤 ファイルアップロード", "🔍 検索", "📚 文書一覧"])
-
-# ========== Tab 1: ファイルアップロード ==========
-with tab_upload:
-    st.header("📤 PDF/画像ファイルのアップロード")
-    
-    uploaded_file = st.file_uploader(
-        "PDFまたは画像ファイルを選択",
-        type=["pdf", "png", "jpg", "jpeg", "tiff", "bmp"],
-        help="PDFまたは画像ファイルをアップロードしてOCR処理を行います"
-    )
-    
-    if uploaded_file is not None:
-        file_ext = Path(uploaded_file.name).suffix.lower()
-        
-        # ファイル保存
-        save_path = UPLOADS_DIR / uploaded_file.name
-        with open(save_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        
-        # PDF処理
-        if file_ext == ".pdf":
-            if not PDF_AVAILABLE:
-                st.error("pdf2imageがインストールされていません。pip install pdf2image poppler-utils")
-            else:
-                try:
-                    with st.spinner("PDFを画像に変換中..."):
-                        images = pdf_to_images(save_path, dpi=PDF_DPI)
-                    st.success(f"✅ PDFを{len(images)}ページの画像に変換しました")
-                    
-                    # 最初のページを表示
-                    if images:
-                        st.subheader("📄 プレビュー（最初のページ）")
-                        st.image(images[0], caption=f"Page 1/{len(images)}", use_container_width=True)
-                        
-                        # 画像をnumpy配列に変換
-                        img_array = np.array(images[0])
-                        if len(img_array.shape) == 3:
-                            img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-                        
-                        # 前処理
-                        processed = preprocess_image(
-                            img_array,
-                            contrast=contrast,
-                            brightness=brightness,
-                            threshold=threshold,
-                            use_adaptive=use_adaptive,
-                        )
-                        
-                        # 前処理後の画像を表示
-                        st.subheader("🔧 前処理後の画像")
-                        st.image(processed, caption="前処理後", use_container_width=True)
-                        
-                        # OCR実行
-                        if st.button("🔍 OCR実行", type="primary"):
-                            all_text = []
-                            progress_bar = st.progress(0)
-                            status_text = st.empty()
-                            
-                            for i, img in enumerate(images):
-                                status_text.text(f"ページ {i+1}/{len(images)} を処理中...")
-                                img_array = np.array(img)
-                                if len(img_array.shape) == 3:
-                                    img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-                                
-                                processed = preprocess_image(
-                                    img_array,
-                                    contrast=contrast,
-                                    brightness=brightness,
-                                    threshold=threshold,
-                                    use_adaptive=use_adaptive,
-                                )
-                                
-                                try:
-                                    text = perform_ocr(processed, lang=lang, psm=psm, oem=oem)
-                                    if text:
-                                        all_text.append(f"=== ページ {i+1} ===\n{text}\n")
-                                except Exception as e:
-                                    st.error(f"ページ {i+1} のOCRエラー: {e}")
-                                
-                                progress_bar.progress((i + 1) / len(images))
-                            
-                            if all_text:
-                                full_text = "\n".join(all_text)
-                                
-                                # ドキュメント作成
-                                doc_id = now_id()
-                                doc = Doc(
-                                    id=doc_id,
-                                    filename=uploaded_file.name,
-                                    text=full_text,
-                                    uploaded_at=datetime.now().isoformat(),
-                                    meta={
-                                        "id": doc_id,
-                                        "filename": uploaded_file.name,
-                                        "text": full_text,
-                                        "uploaded_at": datetime.now().isoformat(),
-                                        "ocr_settings": {
-                                            "lang": lang,
-                                            "psm": psm,
-                                            "oem": oem,
-                                            "contrast": contrast,
-                                            "brightness": brightness,
-                                            "threshold": threshold,
-                                            "use_adaptive": use_adaptive,
-                                        },
-                                    },
-                                )
-                                
-                                # セッションに追加
-                                st.session_state.documents.append(doc)
-                                
-                                # JSON保存
-                                json_path = OCR_RESULTS_DIR / f"{doc_id}.json"
-                                with open(json_path, "w", encoding="utf-8") as f:
-                                    json.dump(doc.meta, f, ensure_ascii=False, indent=2)
-                                
-                                # RAG登録
-                                if CHROMADB_AVAILABLE:
-                                    ok, msg = rag_add_doc(doc)
-                                    if ok:
-                                        st.success(f"✅ OCR完了: {msg}")
-                                    else:
-                                        st.warning(f"⚠️ OCR完了（RAG登録失敗）: {msg}")
-                                else:
-                                    st.success("✅ OCR完了")
-                                
-                                # 結果表示
-                                st.subheader("📝 OCR結果")
-                                st.text_area("抽出されたテキスト", full_text, height=400)
-                                
-                                status_text.empty()
-                                progress_bar.empty()
-                except Exception as e:
-                    st.error(f"PDF処理エラー: {e}")
-        
-        # 画像処理
+    def add(self, texts: List[str], metas: List[Dict]):
+        emb = self.model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+        if self.embeds is None:
+            self.embeds = emb
         else:
+            self.embeds = np.vstack([self.embeds, emb])
+        self.texts.extend(texts)
+        self.metas.extend(metas)
+
+    def search(self, query: str, top_k=5):
+        q = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True)
+        sims = (self.embeds @ q.T).ravel()
+        idx = sims.argsort()[::-1][:top_k]
+        return [{
+            "score": float(sims[i]),
+            "text": self.texts[i],
+            "meta": self.metas[i]
+        } for i in idx]
+
+# ---- インデックス構築（モード選択）----
+def build_index(doc: Dict, mode: str = "tfidf", chunk_size=1000, overlap=200):
+    texts, metas = [], []
+    merged = join_text(doc)
+    for c in chunk_text(merged, chunk_size=chunk_size, overlap=overlap):
+        texts.append(c)
+        metas.append({
+            "page_num": None,
+            "title": doc.get("title") or doc.get("source") or "",
+            "source": doc.get("source") or doc.get("doc_id") or "",
+        })
+    if mode == "tfidf":
+        idx = TfIdfIndex()
+        idx.add(texts, metas)
+        return idx
+    elif mode == "embed":
+        idx = EmbeddingIndex(model_name=st.session_state.get("embed_model", "paraphrase-multilingual-MiniLM-L12-v2"))
+        idx.add(texts, metas)
+        return idx
+    else:
+        raise ValueError("mode は 'tfidf' か 'embed' を指定してください。")
+
+# ---- サイドバー ----
+with st.sidebar:
+    st.header("⚙️ Cloud運用モード")
+    mode = st.radio("検索モード", ["TF‑IDF（軽量・推奨）", "埋め込み（Sentence‑Transformers）"], index=0)
+    top_k = st.slider("Top‑K", 1, 10, 5)
+    st.caption("※ 埋め込みモードは初回ダウンロードに時間がかかる場合があります。")
+    if mode.startswith("埋め込み"):
+        st.session_state["embed_model"] = st.selectbox(
+            "モデル", ["paraphrase-multilingual-MiniLM-L12-v2", "all-MiniLM-L6-v2"], index=0
+        )
+    st.markdown("---")
+    st.subheader("RAG（ChromaDB）")
+    if CHROMA_OK:
+        st.caption("※ 今回はインメモリ検索のみ（ChromaDBは未使用）。必要なら後で追加可能。")
+    else:
+        st.warning(f"ChromaDB 未使用（理由: {CHROMA_ERR}）")
+
+# ---- メインUI ----
+st.title(f"{PAGE_ICON} {PAGE_TITLE}")
+tab1, tab2, tab3 = st.tabs(["📤 JSONアップロード", "🔗 URLからロード", "🔍 検索"])
+
+# 1) JSONアップロード
+with tab1:
+    st.header("📤 ローカルOCR生成の JSON を読み込む")
+    up = st.file_uploader("OCR結果JSON（local_ocr_to_json.py の出力）", type=["json"])
+    if up:
+        doc = load_json_from_upload(up)
+        if doc and validate_schema(doc):
+            idx_mode = "tfidf" if mode.startswith("TF") else "embed"
+            with st.spinner("インデックス構築中…"):
+                st.session_state["index"] = build_index(doc, mode=idx_mode, chunk_size=1000, overlap=200)
+                st.session_state["doc_title"] = doc.get("title") or doc.get("source") or up.name
+            st.success("読み込み完了。検索タブへどうぞ。")
+
+# 2) URLロード
+with tab2:
+    st.header("🔗 GitHub Raw 等の URL から読み込み")
+    url = st.text_input("JSONのURL")
+    if st.button("URLから読み込む") and url.strip():
+        doc = load_json_from_url(url.strip())
+        if doc and validate_schema(doc):
+            idx_mode = "tfidf" if mode.startswith("TF") else "embed"
+            with st.spinner("インデックス構築中…"):
+                st.session_state["index"] = build_index(doc, mode=idx_mode, chunk_size=1000, overlap=200)
+                st.session_state["doc_title"] = doc.get("title") or doc.get("source") or url
+            st.success("読み込み完了。検索タブへどうぞ。")
+
+# 3) 検索
+with tab3:
+    st.header(f"🔍 検索（{st.session_state.get('doc_title') or '未読込'}）")
+    if st.session_state.get("index") is None:
+        st.info("まず JSON を読み込んでください。")
+    else:
+        q = st.text_input("質問・キーワード")
+        if st.button("検索") and q.strip():
             try:
-                # 画像読み込み
-                img = Image.open(uploaded_file)
-                img_array = np.array(img)
-                if len(img_array.shape) == 3:
-                    img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-                
-                st.subheader("📄 元の画像")
-                st.image(img, caption=uploaded_file.name, use_container_width=True)
-                
-                # 前処理
-                processed = preprocess_image(
-                    img_array,
-                    contrast=contrast,
-                    brightness=brightness,
-                    threshold=threshold,
-                    use_adaptive=use_adaptive,
-                )
-                
-                # 前処理後の画像を表示
-                st.subheader("🔧 前処理後の画像")
-                st.image(processed, caption="前処理後", use_container_width=True)
-                
-                # OCR実行
-                if st.button("🔍 OCR実行", type="primary"):
-                    try:
-                        text = perform_ocr(processed, lang=lang, psm=psm, oem=oem)
-                        
-                        if text:
-                            # ドキュメント作成
-                            doc_id = now_id()
-                            doc = Doc(
-                                id=doc_id,
-                                filename=uploaded_file.name,
-                                text=text,
-                                uploaded_at=datetime.now().isoformat(),
-                                meta={
-                                    "id": doc_id,
-                                    "filename": uploaded_file.name,
-                                    "text": text,
-                                    "uploaded_at": datetime.now().isoformat(),
-                                    "ocr_settings": {
-                                        "lang": lang,
-                                        "psm": psm,
-                                        "oem": oem,
-                                        "contrast": contrast,
-                                        "brightness": brightness,
-                                        "threshold": threshold,
-                                        "use_adaptive": use_adaptive,
-                                    },
-                                },
-                            )
-                            
-                            # セッションに追加
-                            st.session_state.documents.append(doc)
-                            
-                            # JSON保存
-                            json_path = OCR_RESULTS_DIR / f"{doc_id}.json"
-                            with open(json_path, "w", encoding="utf-8") as f:
-                                json.dump(doc.meta, f, ensure_ascii=False, indent=2)
-                            
-                            # RAG登録
-                            if CHROMADB_AVAILABLE:
-                                ok, msg = rag_add_doc(doc)
-                                if ok:
-                                    st.success(f"✅ OCR完了: {msg}")
-                                else:
-                                    st.warning(f"⚠️ OCR完了（RAG登録失敗）: {msg}")
-                            else:
-                                st.success("✅ OCR完了")
-                            
-                            # 結果表示
-                            st.subheader("📝 OCR結果")
-                            st.text_area("抽出されたテキスト", text, height=400)
-                        else:
-                            st.warning("テキストが抽出されませんでした。前処理設定を調整してください。")
-                    except Exception as e:
-                        st.error(f"OCRエラー: {e}")
-            except Exception as e:
-                st.error(f"画像処理エラー: {e}")
-
-# ========== Tab 2: 検索 ==========
-with tab_search:
-    st.header("🔍 検索（RAGまたは簡易検索）")
-    
-    if len(st.session_state.documents) == 0:
-        st.info("📝 まず「ファイルアップロード」タブからPDF/画像をアップロードしてOCR処理を行ってください。")
-    else:
-        query = st.text_input("検索クエリ", placeholder="例：プラスチック、材料、加工、温度設定…")
-        n_results = st.slider("検索結果数", 1, MAX_SEARCH_RESULTS, DEFAULT_SEARCH_RESULTS)
-        
-        if st.button("🔍 検索実行", type="primary") and query.strip():
-            if CHROMADB_AVAILABLE:
-                with st.spinner("RAG検索中..."):
-                    results = rag_search(query, n_results=n_results)
-                
+                results = st.session_state["index"].search(q.strip(), top_k=top_k)
                 if results:
-                    st.subheader(f"検索結果（RAG）: {len(results)}件")
+                    st.subheader(f"検索結果：{len(results)}件")
                     for i, r in enumerate(results, 1):
-                        meta = r.get("metadata") or {}
-                        dist = r.get("distance")
-                        score = None
-                        if isinstance(dist, (int, float)):
-                            score = 1.0 / (1.0 + dist)
-                        
-                        title = f"結果 {i}: {meta.get('filename','(unknown)')} / doc={meta.get('doc_id','')}"
-                        if score is not None:
-                            title += f" / score≈{score:.3f}"
-                        
-                        with st.expander(title):
-                            st.write("**メタデータ**")
-                            st.json(meta)
+                        score = r.get("score")
+                        with st.expander(f"結果 {i}（score≈{score:.3f}）"):
+                            st.write("**メタ**")
+                            st.json(r.get("meta", {}))
                             st.write("**該当テキスト（chunk）**")
-                            st.text(r.get("text", ""))
+                            st.text(r["text"])
                 else:
-                    st.info("検索結果が見つかりませんでした（RAG）")
-            else:
-                with st.spinner("簡易検索中..."):
-                    hits = simple_search(st.session_state.documents, query, limit=n_results)
-                
-                if hits:
-                    st.subheader(f"検索結果（簡易）: {len(hits)}件")
-                    for i, h in enumerate(hits, 1):
-                        with st.expander(f"結果 {i}: {h['filename']} / doc={h['doc_id']}"):
-                            st.text(h["snippet"])
-                else:
-                    st.info("検索結果が見つかりませんでした（簡易）")
+                    st.info("該当なし。キーワードや表記揺れを調整してください。")
+            except Exception as e:
+                st.error(f"検索中にエラー: {e}")
 
-# ========== Tab 3: 文書一覧 ==========
-with tab_list:
-    st.header("📚 保存済み文書一覧")
-    
-    if len(st.session_state.documents) == 0:
-        st.info("📝 文書がありません。ファイルアップロードを行ってください。")
-    else:
-        st.write(f"**文書数: {len(st.session_state.documents)}**")
-        
-        for doc in st.session_state.documents:
-            with st.expander(f"📄 {doc.filename}（{doc.id}）"):
-                st.write(f"**uploaded_at:** {doc.uploaded_at}")
-                st.write(f"**文字数:** {len(doc.text)}")
-                
-                # プレビュー
-                preview = doc.text[:800] + ("..." if len(doc.text) > 800 else "")
-                st.text(preview)
-                
-                c1, c2, c3 = st.columns([1, 1, 2])
-                
-                with c1:
-                    # JSONダウンロード
-                    st.download_button(
-                        "⬇️ JSONをダウンロード",
-                        data=json.dumps(doc.meta, ensure_ascii=False, indent=2).encode("utf-8"),
-                        file_name=f"{doc.id}.json",
-                        mime="application/json",
-                        key=f"dl_{doc.id}",
-                    )
-                
-                with c2:
-                    if CHROMADB_AVAILABLE:
-                        if st.button("🧠 RAGに登録", key=f"rag_add_{doc.id}"):
-                            ok, msg = rag_add_doc(doc)
-                            (st.success if ok else st.warning)(msg)
-                
-                with c3:
-                    if st.button("🗑️ 削除", key=f"del_{doc.id}"):
-                        # セッションから削除
-                        st.session_state.documents = [d for d in st.session_state.documents if d.id != doc.id]
-                        
-                        # ディスクJSON削除
-                        json_path = OCR_RESULTS_DIR / f"{doc.id}.json"
-                        if json_path.exists():
-                            json_path.unlink()
-                        
-                        # RAG削除
-                        if CHROMADB_AVAILABLE:
-                            rag_delete_doc(doc.id)
-                        
-                        st.success("削除しました")
-                        st.rerun()
+
